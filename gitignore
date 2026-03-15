@@ -1,0 +1,53 @@
+# ── PokéScanner .gitignore ───────────────────────────────────────────────────
+
+# data (too large for GitHub)
+data/raw/
+data/images/
+data/processed/master.csv
+
+# keep these
+!data/processed/label_map.json
+!data/processed/.gitkeep
+!data/raw/.gitkeep
+!data/images/.gitkeep
+
+# model weights (too large — share via Google Drive or HuggingFace Hub)
+model/weights/*.pth
+model/weights/*.pt
+
+# python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# virtual environment
+venv/
+env/
+.env
+*.env
+
+# jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# kaggle
+kaggle.json
+*.json.bak
+
+# gradio
+gradio_cached_examples/
+flagged/
