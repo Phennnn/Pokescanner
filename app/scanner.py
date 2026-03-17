@@ -24,12 +24,12 @@ from torchvision import transforms
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT       = Path(__file__).resolve().parent.parent
-WEIGHTS    = ROOT / "model" / "weights" / "best_model.pth"
+WEIGHTS    = ROOT / "model" / "weights" / "best_model_b2.pth"
 LABEL_MAP  = ROOT / "data" / "processed" / "label_map.json"
 STATS_CSV  = ROOT / "data" / "raw" / "pokemon_stats.csv"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-IMG_SIZE   = 224
+IMG_SIZE   = 260
 MEAN       = [0.485, 0.456, 0.406]
 STD        = [0.229, 0.224, 0.225]
 CONF_THRESHOLD = 0.15          # min confidence to show a result
@@ -60,7 +60,7 @@ TYPE_COLORS = {
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 def load_model(weights_path: Path, num_classes: int, device: torch.device):
-    model = timm.create_model("efficientnet_b0", pretrained=False, num_classes=num_classes)
+    model = timm.create_model("efficientnet_b2", pretrained=False, num_classes=num_classes)
     model.load_state_dict(torch.load(weights_path, map_location=device))
     model.eval()
     model.to(device)

@@ -28,12 +28,12 @@ from torchvision import transforms
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT      = Path(__file__).resolve().parent.parent
-WEIGHTS   = ROOT / "model" / "weights" / "best_model.pth"
+WEIGHTS   = ROOT / "model" / "weights" / "best_model_b2.pth"
 LABEL_MAP = ROOT / "data" / "processed" / "label_map.json"
 STATS_CSV = ROOT / "data" / "raw" / "pokemon_stats.csv"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-IMG_SIZE = 224
+IMG_SIZE = 260
 MEAN     = [0.485, 0.456, 0.406]
 STD      = [0.229, 0.224, 0.225]
 TOP_K    = 5
@@ -67,7 +67,7 @@ idx_to_label = label_map["idx_to_label"]
 NUM_CLASSES  = label_map["num_classes"]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model  = timm.create_model("efficientnet_b0", pretrained=False, num_classes=NUM_CLASSES)
+model  = timm.create_model("efficientnet_b2", pretrained=False, num_classes=NUM_CLASSES)
 model.load_state_dict(torch.load(WEIGHTS, map_location=device))
 model.eval().to(device)
 print(f"Model loaded on {device}")
