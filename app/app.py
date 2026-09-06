@@ -1,381 +1,393 @@
-# ── PokéScanner · app/app.py ──────────────────────────────────────────────────
-# Step 5: Full Gradio web app.
-# Run from project root:
-#   python app/app.py
-#
-# Opens a browser at http://localhost:7860
-# Features:
-#   - Upload image OR use webcam to identify Pokémon
-#   - Confidence bar + top-3 candidates
-#   - Full stats display (HP, ATK, DEF, SP.ATK, SP.DEF, SPD)
-#   - Type badges with weakness chart
-#   - Team builder (up to 6 Pokémon)
-#   - Team analysis (type coverage + weaknesses)
-# ─────────────────────────────────────────────────────────────────────────────
+"""PokeScanner - Gradio web app.
 
-import json
+    python app/app.py        ->  http://localhost:7860
+
+Upload a photo or use the webcam, get an identification with full stats and
+type matchups, and build a team of six with a coverage report.
+
+Two things changed from the first version:
+  * Team state lives in a gr.State, not module globals, so two people on the
+    same server no longer share (and overwrite) one team. That matters as soon
+    as this is deployed anywhere public.
+  * The card shows the image the model actually receives after subject
+    isolation, which makes a wrong answer diagnosable instead of mysterious.
+"""
+
+from __future__ import annotations
+
+import sys
 from pathlib import Path
-from collections import defaultdict
 
 import gradio as gr
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn.functional as F
-import timm
-from PIL import Image
-from torchvision import transforms
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-ROOT      = Path(__file__).resolve().parent.parent
-WEIGHTS   = ROOT / "model" / "weights" / "best_model_b2.pth"
-LABEL_MAP = ROOT / "data" / "processed" / "label_map.json"
-STATS_CSV = ROOT / "data" / "raw" / "pokemon_stats.csv"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# ── Config ────────────────────────────────────────────────────────────────────
-IMG_SIZE = 260
-MEAN     = [0.485, 0.456, 0.406]
-STD      = [0.229, 0.224, 0.225]
-TOP_K    = 5
+from pokescanner import dex                            # noqa: E402
+from pokescanner.inference import PokemonClassifier    # noqa: E402
 
-# ── Type colours (hex) ────────────────────────────────────────────────────────
-TYPE_COLORS = {
-    "fire":     "#FF6B35", "water":    "#4A9EFF", "grass":    "#5DBE6E",
-    "electric": "#FFD700", "psychic":  "#FF6EB4", "ice":      "#96D9D6",
-    "dragon":   "#6F35FC", "dark":     "#705746", "fairy":    "#D685AD",
-    "normal":   "#A8A878", "fighting": "#C22E28", "flying":   "#89AAE3",
-    "poison":   "#A33EA1", "ground":   "#E2BF65", "rock":     "#B6A136",
-    "bug":      "#A6B91A", "ghost":    "#735797", "steel":    "#B7B7CE",
-}
+MAX_TEAM = 6
 
-# ── TTA transforms ────────────────────────────────────────────────────────────
-tta_transforms = [
-    transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)), transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
-    transforms.Compose([transforms.Resize((IMG_SIZE+20, IMG_SIZE+20)), transforms.CenterCrop(IMG_SIZE), transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
-    transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)), transforms.RandomHorizontalFlip(p=1.0), transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
-    transforms.Compose([transforms.Resize((IMG_SIZE+30, IMG_SIZE+30)), transforms.CenterCrop(IMG_SIZE), transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
-    transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)), transforms.ColorJitter(brightness=0.2, contrast=0.2), transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
-]
+print("Loading PokeScanner...")
+CLASSIFIER = PokemonClassifier()
+CLASSIFIER.warmup()
 
 
-# ── Load everything at startup ────────────────────────────────────────────────
-print("Loading PokéScanner...")
-
-with open(LABEL_MAP) as f:
-    label_map = json.load(f)
-idx_to_label = label_map["idx_to_label"]
-NUM_CLASSES  = label_map["num_classes"]
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model  = timm.create_model("efficientnet_b2", pretrained=False, num_classes=NUM_CLASSES)
-model.load_state_dict(torch.load(WEIGHTS, map_location=device))
-model.eval().to(device)
-print(f"Model loaded on {device}")
-
-# stats db
-stats_db = {}
-if STATS_CSV.exists():
-    df = pd.read_csv(STATS_CSV)
-    for _, row in df.iterrows():
-        key = str(row["name"]).strip().lower().replace(" ", "-").replace("'", "").replace("'", "")
-        stats_db[key] = {
-            "hp": int(row.get("hp", 0)),
-            "attack": int(row.get("attack", 0)),
-            "defense": int(row.get("defense", 0)),
-            "sp_attack": int(row.get("sp_attack", 0)),
-            "sp_defense": int(row.get("sp_defense", 0)),
-            "speed": int(row.get("speed", 0)),
-            "base_total": int(row.get("base_total", 0)),
-            "type1": str(row.get("type1", "")).lower().strip(),
-            "type2": str(row.get("type2", "")).lower().strip(),
-            "legendary": bool(row.get("is_legendary", 0)),
-            "generation": int(row.get("generation", 0)),
-            "pokedex_number": int(row.get("pokedex_number", 0)),
-            "capture_rate": str(row.get("capture_rate", "?")),
-            "classfication": str(row.get("classfication", "")),
-        }
-
-# team state
-team = []
-
-print(f"Ready! {NUM_CLASSES} classes, {len(stats_db)} with stats")
+# -- HTML fragments -----------------------------------------------------------
+def type_badge(t: str) -> str:
+    if not t:
+        return ""
+    return (f'<span style="background:{dex.TYPE_COLORS.get(t, "#888")};color:#fff;'
+            'padding:2px 10px;border-radius:12px;font-size:11px;'
+            'font-family:Rajdhani,sans-serif;font-weight:700;letter-spacing:1px;'
+            f'text-transform:uppercase;margin-right:4px">{t}</span>')
 
 
-# ── Inference ─────────────────────────────────────────────────────────────────
-def predict_image(pil_img):
-    img = pil_img.convert("RGB")
-    tensors = torch.stack([t(img) for t in tta_transforms]).to(device)
-    with torch.no_grad():
-        probs = F.softmax(model(tensors), dim=1).mean(dim=0)
-    top_probs, top_idxs = torch.topk(probs, TOP_K)
-    return [(idx_to_label[str(i.item())], float(p)) for p, i in zip(top_probs, top_idxs)]
+def mult_badge(t: str, mult: float) -> str:
+    label = f"{t} x{mult:g}"
+    return (f'<span style="background:{dex.TYPE_COLORS.get(t, "#888")};color:#fff;'
+            'padding:2px 8px;border-radius:10px;font-size:10px;'
+            'font-family:Rajdhani,sans-serif;font-weight:700;letter-spacing:.5px;'
+            f'text-transform:uppercase;margin:0 4px 4px 0;display:inline-block">'
+            f'{label}</span>')
 
 
-# ── Stat bar HTML ─────────────────────────────────────────────────────────────
-def stat_bar(label, value, max_val=255, color="#4CAF50"):
-    pct = min(100, int(value / max_val * 100))
+def stat_bar(label: str, value: int, color: str) -> str:
+    pct = min(100, int(value / 255 * 100))
     return f"""
     <div style="display:flex;align-items:center;gap:8px;margin:3px 0">
-      <span style="font-family:'Rajdhani',sans-serif;font-size:12px;color:#888;width:64px;flex-shrink:0">{label}</span>
+      <span style="font-family:Rajdhani,sans-serif;font-size:12px;color:#888;
+                   width:64px;flex-shrink:0">{label}</span>
       <div style="flex:1;height:8px;background:#1a1a2e;border-radius:4px;overflow:hidden">
-        <div style="width:{pct}%;height:100%;background:{color};border-radius:4px;transition:width .4s ease"></div>
+        <div style="width:{pct}%;height:100%;background:{color};border-radius:4px"></div>
       </div>
-      <span style="font-family:'Rajdhani',sans-serif;font-size:13px;color:#ddd;width:32px;text-align:right">{value}</span>
+      <span style="font-family:Rajdhani,sans-serif;font-size:13px;color:#ddd;
+                   width:32px;text-align:right">{value}</span>
     </div>"""
 
 
-def type_badge(t):
-    if not t or t == "nan": return ""
-    color = TYPE_COLORS.get(t, "#888")
-    return f'<span style="background:{color};color:#fff;padding:2px 10px;border-radius:12px;font-size:11px;font-family:Rajdhani,sans-serif;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-right:4px">{t}</span>'
+def empty_card(message="No scan yet") -> str:
+    return (f'<div style="color:#555;text-align:center;padding:40px;'
+            f'font-family:Rajdhani,sans-serif">{message}</div>')
 
 
-# ── Build result card HTML ────────────────────────────────────────────────────
-def build_result_html(predictions):
-    if not predictions:
-        return '<div style="color:#555;text-align:center;padding:40px">No prediction yet</div>'
+def build_result_html(result) -> str:
+    if result is None or not result.predictions:
+        return empty_card()
 
-    name, conf = predictions[0]
-    s = stats_db.get(name, {})
-    display_name = name.replace("-", " ").title()
-    t1 = s.get("type1", "")
-    t2 = s.get("type2", "")
-    dex_num = s.get("pokedex_number", "?")
-    gen     = s.get("generation", "?")
-    cls     = s.get("classfication", "")
-    cap     = s.get("capture_rate", "?")
-    legendary = s.get("legendary", False)
-
+    top = result.predictions[0]
+    s = top.stats
+    conf = top.confidence
+    conf_pct = int(conf * 100)
     conf_color = "#4CAF50" if conf > 0.5 else "#FF9800" if conf > 0.25 else "#f44336"
-    conf_pct   = int(conf * 100)
 
-    # confidence bar
+    unsure = ""
+    if not result.is_confident:
+        unsure = ('<div style="background:#2a1a00;border:1px solid #FF9800;'
+                  'color:#FF9800;padding:6px 10px;border-radius:6px;font-size:11px;'
+                  'font-family:Rajdhani,sans-serif;margin-bottom:10px">'
+                  'LOW CONFIDENCE - try filling more of the frame, better light, '
+                  'or a plainer background</div>')
+
     conf_bar = f"""
     <div style="margin-bottom:12px">
       <div style="display:flex;justify-content:space-between;margin-bottom:4px">
         <span style="font-size:11px;color:#666;font-family:Rajdhani,sans-serif">CONFIDENCE</span>
-        <span style="font-size:13px;font-weight:700;color:{conf_color};font-family:Rajdhani,sans-serif">{conf_pct}%</span>
+        <span style="font-size:13px;font-weight:700;color:{conf_color};
+                     font-family:Rajdhani,sans-serif">{conf_pct}%</span>
       </div>
       <div style="height:6px;background:#1a1a2e;border-radius:3px;overflow:hidden">
-        <div style="width:{conf_pct}%;height:100%;background:{conf_color};border-radius:3px"></div>
+        <div style="width:{conf_pct}%;height:100%;background:{conf_color};
+                    border-radius:3px"></div>
       </div>
     </div>"""
 
-    # name + dex
+    dex_num = s.get("pokedex_number", 0)
+    dex_str = f"#{dex_num:03d}" if dex_num else "#???"
     header = f"""
-    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;
+                margin-bottom:6px">
       <div>
-        <div style="font-family:'Rajdhani',sans-serif;font-size:28px;font-weight:700;color:#fff;line-height:1">{display_name}</div>
-        <div style="font-size:11px;color:#555;font-family:Rajdhani,sans-serif;margin-top:2px">{cls}</div>
+        <div style="font-family:Rajdhani,sans-serif;font-size:28px;font-weight:700;
+                    color:#fff;line-height:1">{top.display_name}</div>
+        <div style="font-size:11px;color:#555;font-family:Rajdhani,sans-serif;
+                    margin-top:2px">{s.get('classfication', '')}</div>
       </div>
       <div style="text-align:right">
-        <div style="font-family:'Rajdhani',sans-serif;font-size:22px;font-weight:700;color:#333">#{str(dex_num).zfill(3) if str(dex_num).isdigit() else dex_num}</div>
-        <div style="font-size:11px;color:#444;font-family:Rajdhani,sans-serif">GEN {gen}</div>
+        <div style="font-family:Rajdhani,sans-serif;font-size:22px;font-weight:700;
+                    color:#333">{dex_str}</div>
+        <div style="font-size:11px;color:#444;font-family:Rajdhani,sans-serif">
+          GEN {s.get('generation', '?') or '?'}</div>
       </div>
     </div>"""
 
-    types = f'<div style="margin-bottom:12px">{type_badge(t1)}{type_badge(t2)}</div>'
+    types = ('<div style="margin-bottom:12px">'
+             + "".join(type_badge(t) for t in s.get("types", [])) + "</div>")
 
-    legendary_badge = '<div style="display:inline-block;background:#1a1400;border:1px solid #FFD700;color:#FFD700;padding:2px 10px;border-radius:4px;font-size:11px;font-family:Rajdhani,sans-serif;font-weight:700;letter-spacing:1px;margin-bottom:12px">* LEGENDARY</div>' if legendary else ""
+    legendary = ""
+    if s.get("legendary"):
+        legendary = ('<div style="display:inline-block;background:#1a1400;'
+                     'border:1px solid #FFD700;color:#FFD700;padding:2px 10px;'
+                     'border-radius:4px;font-size:11px;font-family:Rajdhani,sans-serif;'
+                     'font-weight:700;letter-spacing:1px;margin-bottom:12px">'
+                     '* LEGENDARY</div>')
 
-    # stats
-    stats_html = ""
-    if s:
+    if s.get("has_stats"):
         stats_html = f"""
         <div style="margin:12px 0">
-          {stat_bar("HP",       s.get("hp",0),        255, "#FF5959")}
-          {stat_bar("Attack",   s.get("attack",0),     255, "#F5AC78")}
-          {stat_bar("Defense",  s.get("defense",0),    255, "#FAE078")}
-          {stat_bar("Sp. Atk",  s.get("sp_attack",0),  255, "#9DB7F5")}
-          {stat_bar("Sp. Def",  s.get("sp_defense",0), 255, "#A7DB8D")}
-          {stat_bar("Speed",    s.get("speed",0),       255, "#FA92B2")}
+          {stat_bar("HP", s.get("hp", 0), "#FF5959")}
+          {stat_bar("Attack", s.get("attack", 0), "#F5AC78")}
+          {stat_bar("Defense", s.get("defense", 0), "#FAE078")}
+          {stat_bar("Sp. Atk", s.get("sp_attack", 0), "#9DB7F5")}
+          {stat_bar("Sp. Def", s.get("sp_defense", 0), "#A7DB8D")}
+          {stat_bar("Speed", s.get("speed", 0), "#FA92B2")}
         </div>
-        <div style="display:flex;gap:16px;font-family:Rajdhani,sans-serif;font-size:12px;color:#555;margin-top:8px">
-          <span>BST <strong style="color:#aaa">{s.get("base_total",0)}</strong></span>
-          <span>Catch rate <strong style="color:#aaa">{cap}</strong></span>
+        <div style="display:flex;gap:16px;font-family:Rajdhani,sans-serif;
+                    font-size:12px;color:#555;margin-top:8px">
+          <span>BST <strong style="color:#aaa">{s.get('base_total', 0)}</strong></span>
+          <span>Catch <strong style="color:#aaa">{s.get('capture_rate', '?')}</strong></span>
+          <span>HT <strong style="color:#aaa">{s.get('height_m', 0)}m</strong></span>
+          <span>WT <strong style="color:#aaa">{s.get('weight_kg', 0)}kg</strong></span>
+        </div>"""
+    else:
+        stats_html = ('<div style="font-family:Rajdhani,sans-serif;font-size:12px;'
+                      'color:#555;margin:12px 0">Base stats are not in the dataset '
+                      'for this form.</div>')
+
+    weak = dex.weaknesses(top.label)
+    resist = dex.resistances(top.label)
+    matchup_html = ""
+    if weak or resist:
+        weak_row = "".join(mult_badge(t, m) for t, m in
+                           sorted(weak.items(), key=lambda kv: -kv[1]))
+        res_row = "".join(mult_badge(t, m) for t, m in
+                          sorted(resist.items(), key=lambda kv: kv[1]))
+        matchup_html = f"""
+        <div style="margin-top:14px;padding-top:12px;border-top:1px solid #1a1a2e">
+          <div style="font-size:11px;color:#444;font-family:Rajdhani,sans-serif;
+                      margin-bottom:6px">TAKES MORE DAMAGE FROM</div>
+          <div>{weak_row or '<span style="color:#333">nothing</span>'}</div>
+          <div style="font-size:11px;color:#444;font-family:Rajdhani,sans-serif;
+                      margin:10px 0 6px">RESISTS</div>
+          <div>{res_row or '<span style="color:#333">nothing</span>'}</div>
         </div>"""
 
-    # other candidates
     others = ""
-    if len(predictions) > 1:
-        others = '<div style="margin-top:14px;padding-top:12px;border-top:1px solid #1a1a2e"><div style="font-size:11px;color:#444;font-family:Rajdhani,sans-serif;margin-bottom:6px">OTHER CANDIDATES</div>'
-        for alt_name, alt_conf in predictions[1:]:
-            alt_pct = int(alt_conf * 100)
-            alt_display = alt_name.replace("-", " ").title()
-            others += f'<div style="display:flex;justify-content:space-between;font-family:Rajdhani,sans-serif;font-size:13px;color:#555;margin:3px 0"><span>{alt_display}</span><span>{alt_pct}%</span></div>'
-        others += "</div>"
+    if len(result.predictions) > 1:
+        rows = "".join(
+            f'<div style="display:flex;justify-content:space-between;'
+            f'font-family:Rajdhani,sans-serif;font-size:13px;color:#555;margin:3px 0">'
+            f'<span>{p.display_name}</span><span>{p.percent}%</span></div>'
+            for p in result.predictions[1:])
+        others = ('<div style="margin-top:14px;padding-top:12px;'
+                  'border-top:1px solid #1a1a2e"><div style="font-size:11px;'
+                  'color:#444;font-family:Rajdhani,sans-serif;margin-bottom:6px">'
+                  f'OTHER CANDIDATES</div>{rows}</div>')
+
+    footer = (f'<div style="font-size:10px;color:#2e2e46;'
+              f'font-family:Rajdhani,sans-serif;margin-top:12px">'
+              f'{len(CLASSIFIER.tta)} TTA views  ·  {result.elapsed_ms:.0f} ms</div>')
 
     return f"""
-    <div style="background:#0d0d1a;border:1px solid #1e1e3a;border-radius:12px;padding:18px;font-family:sans-serif">
-      {conf_bar}{header}{types}{legendary_badge}{stats_html}{others}
+    <div style="background:#0d0d1a;border:1px solid #1e1e3a;border-radius:12px;
+                padding:18px;font-family:sans-serif">
+      {unsure}{conf_bar}{header}{types}{legendary}{stats_html}{matchup_html}{others}{footer}
     </div>"""
 
 
-# ── Build team HTML ───────────────────────────────────────────────────────────
-def build_team_html():
+def build_team_html(team) -> str:
     if not team:
-        return '<div style="color:#333;text-align:center;padding:20px;font-family:Rajdhani,sans-serif">No Pokémon in team yet</div>'
+        return ('<div style="color:#333;text-align:center;padding:20px;'
+                'font-family:Rajdhani,sans-serif">No Pokemon in your team yet</div>')
 
     slots = ""
-    for i, name in enumerate(team):
-        s = stats_db.get(name, {})
-        t1 = s.get("type1", "")
-        color = TYPE_COLORS.get(t1, "#333")
-        display = name.replace("-", " ").title()
-        dex = s.get("pokedex_number", "?")
+    for i, label in enumerate(team):
+        s = dex.get(label)
         slots += f"""
-        <div style="background:#0d0d1a;border:1px solid #1e1e3a;border-radius:8px;padding:10px;text-align:center">
-          <div style="font-size:10px;color:#333;font-family:Rajdhani,sans-serif;margin-bottom:2px">{i+1}</div>
-          <div style="font-size:13px;font-weight:700;color:#ddd;font-family:Rajdhani,sans-serif;line-height:1.2">{display}</div>
-          <div style="font-size:10px;color:#444;font-family:Rajdhani,sans-serif">#{dex}</div>
-          <div style="margin-top:4px">{type_badge(t1)}</div>
+        <div style="background:#0d0d1a;border:1px solid #1e1e3a;border-radius:8px;
+                    padding:10px;text-align:center">
+          <div style="font-size:10px;color:#333;font-family:Rajdhani,sans-serif;
+                      margin-bottom:2px">{i + 1}</div>
+          <div style="font-size:13px;font-weight:700;color:#ddd;
+                      font-family:Rajdhani,sans-serif;line-height:1.2">
+            {s['display_name']}</div>
+          <div style="font-size:10px;color:#444;font-family:Rajdhani,sans-serif">
+            #{s.get('pokedex_number', 0) or '???'}</div>
+          <div style="margin-top:4px">
+            {''.join(type_badge(t) for t in s.get('types', [])[:1])}</div>
         </div>"""
+    for i in range(len(team), MAX_TEAM):
+        slots += (f'<div style="background:#08080f;border:1px dashed #1a1a2e;'
+                  f'border-radius:8px;padding:10px;text-align:center;color:#222;'
+                  f'font-family:Rajdhani,sans-serif;font-size:11px">{i + 1}<br>'
+                  f'empty</div>')
+    return (f'<div style="display:grid;grid-template-columns:repeat({MAX_TEAM},1fr);'
+            f'gap:8px">{slots}</div>')
 
-    # empty slots
-    for i in range(len(team), 6):
-        slots += f'<div style="background:#08080f;border:1px dashed #1a1a2e;border-radius:8px;padding:10px;text-align:center;color:#222;font-family:Rajdhani,sans-serif;font-size:11px">{i+1}<br>empty</div>'
 
-    return f'<div style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px">{slots}</div>'
-
-
-def build_analysis_html():
+def build_analysis_html(team) -> str:
     if not team:
         return ""
+    report = dex.team_report(team)
 
-    type_count = defaultdict(int)
-    weaknesses = defaultdict(float)
+    coverage = "".join(
+        f'{type_badge(t)}<span style="font-size:11px;color:#555;'
+        f'font-family:Rajdhani,sans-serif">x{c} </span>'
+        for t, c in report["type_counts"].items())
 
-    for name in team:
-        s = stats_db.get(name, {})
-        t1 = s.get("type1", "")
-        t2 = s.get("type2", "")
-        if t1: type_count[t1] += 1
-        if t2 and t2 != "nan": type_count[t2] += 1
+    shared = [(t, c) for t, c in report["weaknesses"].items() if c >= 2]
+    weak_html = "".join(
+        f'{type_badge(t)}<span style="font-size:11px;color:#555;'
+        f'font-family:Rajdhani,sans-serif">{c} members </span>'
+        for t, c in shared[:6])
 
-        # weakness from type matchup columns
-        df_row = pd.read_csv(STATS_CSV) if STATS_CSV.exists() else pd.DataFrame()
-        if not df_row.empty:
-            match = df_row[df_row["name"].str.lower().str.replace(" ", "-").str.replace("'", "") == name]
-            if not match.empty:
-                row = match.iloc[0]
-                for col in [c for c in df_row.columns if c.startswith("against_")]:
-                    etype = col.replace("against_", "")
-                    val = float(row.get(col, 1.0))
-                    if val > 1.0:
-                        weaknesses[etype] += 1
-
-    type_html = "".join(f'{type_badge(t)}<span style="font-size:11px;color:#555;font-family:Rajdhani,sans-serif">x{c} </span>' for t, c in sorted(type_count.items(), key=lambda x: -x[1]))
-    weak_html  = "".join(f'{type_badge(t)}<span style="font-size:11px;color:#555;font-family:Rajdhani,sans-serif">({int(c)}) </span>' for t, c in sorted(weaknesses.items(), key=lambda x: -x[1])[:6])
+    gaps = report["uncovered_types"]
+    gaps_html = "".join(type_badge(t) for t in gaps)
 
     return f"""
-    <div style="background:#0d0d1a;border:1px solid #1e1e3a;border-radius:12px;padding:16px;margin-top:10px">
-      <div style="font-family:Rajdhani,sans-serif;font-size:11px;color:#444;margin-bottom:8px">TYPE COVERAGE</div>
-      <div style="margin-bottom:12px">{type_html or '<span style="color:#333">—</span>'}</div>
-      <div style="font-family:Rajdhani,sans-serif;font-size:11px;color:#444;margin-bottom:8px">COMMON WEAKNESSES</div>
-      <div>{weak_html or '<span style="color:#444">None detected</span>'}</div>
+    <div style="background:#0d0d1a;border:1px solid #1e1e3a;border-radius:12px;
+                padding:16px;margin-top:10px">
+      <div style="font-family:Rajdhani,sans-serif;font-size:11px;color:#444;
+                  margin-bottom:8px">TYPE COVERAGE</div>
+      <div style="margin-bottom:12px">{coverage or '<span style="color:#333">-</span>'}</div>
+
+      <div style="font-family:Rajdhani,sans-serif;font-size:11px;color:#444;
+                  margin-bottom:8px">SHARED WEAKNESSES (2+ members)</div>
+      <div style="margin-bottom:12px">
+        {weak_html or '<span style="color:#4CAF50;font-size:12px;font-family:Rajdhani,sans-serif">None - the team is well spread</span>'}</div>
+
+      <div style="font-family:Rajdhani,sans-serif;font-size:11px;color:#444;
+                  margin-bottom:8px">NO SUPER-EFFECTIVE COVERAGE AGAINST</div>
+      <div>{gaps_html or '<span style="color:#4CAF50;font-size:12px;font-family:Rajdhani,sans-serif">Every type is covered</span>'}</div>
     </div>"""
 
 
-# ── Gradio handlers ───────────────────────────────────────────────────────────
-current_predictions = []
-
-def on_scan(image):
-    global current_predictions
+# -- handlers -----------------------------------------------------------------
+def on_scan(image, isolate, team):
     if image is None:
-        return build_result_html([]), build_team_html(), build_analysis_html()
-    pil = Image.fromarray(image) if isinstance(image, np.ndarray) else image
-    current_predictions = predict_image(pil)
-    return build_result_html(current_predictions), build_team_html(), build_analysis_html()
+        return (empty_card("Upload an image or take a webcam shot first"),
+                None, None, build_team_html(team), build_analysis_html(team))
+    CLASSIFIER.isolate = bool(isolate)
+    result = CLASSIFIER.predict(image)
+    model_input = CLASSIFIER.prepare(image)
+    return (build_result_html(result), result, model_input,
+            build_team_html(team), build_analysis_html(team))
 
 
-def on_add():
-    global team
-    if not current_predictions:
-        return build_team_html(), build_analysis_html(), "Scan a Pokémon first!"
-    name, conf = current_predictions[0]
-    if len(team) >= 6:
-        return build_team_html(), build_analysis_html(), "Team is full (6/6)!"
-    if name in team:
-        return build_team_html(), build_analysis_html(), f"{name.replace('-',' ').title()} is already in your team!"
-    team.append(name)
-    msg = f"Added {name.replace('-',' ').title()} to team! ({len(team)}/6)"
-    return build_team_html(), build_analysis_html(), msg
+def on_add(result, team):
+    team = list(team or [])
+    if result is None or not result.predictions:
+        return team, build_team_html(team), build_analysis_html(team), "Scan something first"
+    top = result.predictions[0]
+    if not result.is_confident:
+        return (team, build_team_html(team), build_analysis_html(team),
+                "Confidence is too low to trust - try another shot")
+    if len(team) >= MAX_TEAM:
+        return team, build_team_html(team), build_analysis_html(team), "Team is full (6/6)"
+    if top.label in team:
+        return (team, build_team_html(team), build_analysis_html(team),
+                f"{top.display_name} is already on the team")
+    team.append(top.label)
+    return (team, build_team_html(team), build_analysis_html(team),
+            f"Added {top.display_name} ({len(team)}/6)")
+
+
+def on_undo(team):
+    team = list(team or [])
+    if not team:
+        return team, build_team_html(team), build_analysis_html(team), "Team is empty"
+    removed = dex.get(team.pop())["display_name"]
+    return (team, build_team_html(team), build_analysis_html(team),
+            f"Removed {removed}")
 
 
 def on_clear():
-    global team
-    team = []
-    return build_team_html(), build_analysis_html(), "Team cleared!"
+    return [], build_team_html([]), build_analysis_html([]), "Team cleared"
 
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
 CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=DM+Sans:wght@300;400;500&display=swap');
-
-body, .gradio-container { background: #07070f !important; font-family: 'DM Sans', sans-serif !important; }
-.gradio-container { max-width: 1100px !important; margin: 0 auto !important; }
-
-h1 { font-family: 'Rajdhani', sans-serif !important; font-size: 32px !important; font-weight: 700 !important;
-     letter-spacing: 2px !important; color: #fff !important; margin: 0 !important; }
-
-.scan-btn { background: #e8362a !important; border: none !important; color: #fff !important;
-            font-family: 'Rajdhani', sans-serif !important; font-weight: 700 !important;
-            letter-spacing: 1px !important; font-size: 15px !important; }
-.scan-btn:hover { background: #c42a1f !important; }
-
-.add-btn  { background: transparent !important; border: 1px solid #1e1e3a !important; color: #aaa !important;
-            font-family: 'Rajdhani', sans-serif !important; font-weight: 600 !important; }
-.add-btn:hover  { border-color: #4CAF50 !important; color: #4CAF50 !important; }
-
-.clear-btn { background: transparent !important; border: 1px solid #1e1e3a !important; color: #555 !important;
-             font-family: 'Rajdhani', sans-serif !important; }
-.clear-btn:hover { border-color: #e8362a !important; color: #e8362a !important; }
-
-.gr-panel, .gr-box { background: #0d0d1a !important; border: 1px solid #1e1e3a !important; border-radius: 12px !important; }
-.gr-input { background: #07070f !important; border: 1px solid #1e1e3a !important; color: #fff !important; }
-label { color: #555 !important; font-family: 'Rajdhani', sans-serif !important; font-size: 11px !important; letter-spacing: 1px !important; }
-.status-msg { font-family: 'Rajdhani', sans-serif !important; font-size: 13px !important; color: #4CAF50 !important; }
+body, .gradio-container { background:#07070f !important; font-family:'DM Sans',sans-serif !important; }
+.gradio-container { max-width:1100px !important; margin:0 auto !important; }
+h1 { font-family:'Rajdhani',sans-serif !important; font-size:32px !important; font-weight:700 !important;
+     letter-spacing:2px !important; color:#fff !important; margin:0 !important; }
+.scan-btn { background:#e8362a !important; border:none !important; color:#fff !important;
+            font-family:'Rajdhani',sans-serif !important; font-weight:700 !important;
+            letter-spacing:1px !important; font-size:15px !important; }
+.scan-btn:hover { background:#c42a1f !important; }
+.add-btn { background:transparent !important; border:1px solid #1e1e3a !important; color:#aaa !important;
+           font-family:'Rajdhani',sans-serif !important; font-weight:600 !important; }
+.add-btn:hover { border-color:#4CAF50 !important; color:#4CAF50 !important; }
+.clear-btn { background:transparent !important; border:1px solid #1e1e3a !important; color:#555 !important;
+             font-family:'Rajdhani',sans-serif !important; }
+.clear-btn:hover { border-color:#e8362a !important; color:#e8362a !important; }
+.gr-panel, .gr-box { background:#0d0d1a !important; border:1px solid #1e1e3a !important; border-radius:12px !important; }
+label { color:#555 !important; font-family:'Rajdhani',sans-serif !important; font-size:11px !important; letter-spacing:1px !important; }
+.status-msg { font-family:'Rajdhani',sans-serif !important; font-size:13px !important; color:#4CAF50 !important; }
 """
 
-# ── UI ────────────────────────────────────────────────────────────────────────
-with gr.Blocks(css=CSS, title="PokéScanner") as demo:
+
+# Gradio 6 moved `css` from the Blocks constructor to launch(); older
+# versions only accept it on Blocks. Pass it wherever this version wants it.
+GRADIO_MAJOR = int(gr.__version__.split(".")[0])
+_blocks_kwargs = {"title": "PokeScanner"}
+if GRADIO_MAJOR < 6:
+    _blocks_kwargs["css"] = CSS
+
+with gr.Blocks(**_blocks_kwargs) as demo:
+    team_state = gr.State([])
+    result_state = gr.State(None)
 
     gr.HTML("""
     <div style="display:flex;align-items:center;gap:14px;padding:20px 0 10px">
-      <div style="width:36px;height:36px;background:#e8362a;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px">&#9673;</div>
+      <div style="width:36px;height:36px;background:#e8362a;border-radius:50%;
+                  display:flex;align-items:center;justify-content:center;
+                  font-size:18px">&#9673;</div>
       <div>
         <h1>Poke<span style="color:#e8362a">Scanner</span></h1>
-        <div style="font-family:Rajdhani,sans-serif;font-size:11px;color:#333;letter-spacing:2px">REAL-TIME POKEMON IDENTIFIER</div>
+        <div style="font-family:Rajdhani,sans-serif;font-size:11px;color:#333;
+                    letter-spacing:2px">REAL-TIME POKEMON IDENTIFIER</div>
       </div>
     </div>
     """)
 
     with gr.Row():
         with gr.Column(scale=1):
-            image_input = gr.Image(
-                label="UPLOAD IMAGE OR USE WEBCAM",
-                sources=["upload", "webcam"],
-                type="numpy",
-                height=320,
-            )
-            scan_btn  = gr.Button("SCAN",        elem_classes="scan-btn")
+            image_input = gr.Image(label="UPLOAD IMAGE OR USE WEBCAM",
+                                   sources=["upload", "webcam"],
+                                   type="numpy", height=320)
+            scan_btn = gr.Button("SCAN", elem_classes="scan-btn")
+            isolate_cb = gr.Checkbox(
+                value=CLASSIFIER.isolate, label="ISOLATE SUBJECT",
+                info="Crop to the Pokemon before classifying. Turn off to compare.")
             with gr.Row():
-                add_btn   = gr.Button("+ ADD TO TEAM", elem_classes="add-btn")
-                clear_btn = gr.Button("CLEAR TEAM",    elem_classes="clear-btn")
-            status_box = gr.Textbox(label="", interactive=False, elem_classes="status-msg")
+                add_btn = gr.Button("+ ADD TO TEAM", elem_classes="add-btn")
+                undo_btn = gr.Button("UNDO", elem_classes="add-btn")
+                clear_btn = gr.Button("CLEAR", elem_classes="clear-btn")
+            status_box = gr.Textbox(label="", interactive=False,
+                                    elem_classes="status-msg")
+            model_input_img = gr.Image(label="WHAT THE MODEL SEES", height=180,
+                                       interactive=False)
 
         with gr.Column(scale=1):
-            result_html = gr.HTML(build_result_html([]))
+            result_html = gr.HTML(empty_card())
 
-    gr.HTML('<div style="font-family:Rajdhani,sans-serif;font-size:11px;color:#333;letter-spacing:2px;margin:16px 0 8px">MY TEAM</div>')
-    team_html     = gr.HTML(build_team_html())
+    gr.HTML('<div style="font-family:Rajdhani,sans-serif;font-size:11px;color:#333;'
+            'letter-spacing:2px;margin:16px 0 8px">MY TEAM</div>')
+    team_html = gr.HTML(build_team_html([]))
     analysis_html = gr.HTML("")
 
-    # wire up
-    scan_btn.click(on_scan,  inputs=image_input,    outputs=[result_html, team_html, analysis_html])
-    add_btn.click( on_add,   inputs=None,            outputs=[team_html, analysis_html, status_box])
-    clear_btn.click(on_clear, inputs=None,           outputs=[team_html, analysis_html, status_box])
+    scan_btn.click(on_scan, [image_input, isolate_cb, team_state],
+                   [result_html, result_state, model_input_img, team_html, analysis_html])
+    add_btn.click(on_add, [result_state, team_state],
+                  [team_state, team_html, analysis_html, status_box])
+    undo_btn.click(on_undo, [team_state],
+                   [team_state, team_html, analysis_html, status_box])
+    clear_btn.click(on_clear, None,
+                    [team_state, team_html, analysis_html, status_box])
 
 
 if __name__ == "__main__":
-    demo.launch(inbrowser=True)
+    launch_kwargs = {"inbrowser": True}
+    if GRADIO_MAJOR >= 6:
+        launch_kwargs["css"] = CSS
+    demo.launch(**launch_kwargs)
