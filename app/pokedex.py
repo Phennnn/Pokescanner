@@ -16,7 +16,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pokescanner import dex
+from pokescanner import cards, dex, identify
 from pokescanner.inference import PokemonClassifier
 
 TOP_K = 4
@@ -44,6 +44,7 @@ def health():
         "device": str(CLASSIFIER.device),
         "classes": CLASSIFIER.num_classes,
         "isolate": CLASSIFIER.isolate,
+        "ocr": cards.OCR.kind,
     })
 
 
@@ -65,19 +66,32 @@ def predict():
         return jsonify({"error": "could not read that image"}), 400
 
     CLASSIFIER.isolate = bool(payload.get("isolate", CLASSIFIER.isolate))
-    result = CLASSIFIER.predict(pil_img, top_k=TOP_K)
+    mode = payload.get("mode", "auto")
+    if mode not in ("auto", "card", "model"):
+        mode = "auto"
+
+    ident = identify.identify(pil_img, CLASSIFIER, mode=mode, top_k=TOP_K)
 
     predictions = []
-    for p in result.predictions:
-        entry = p.to_dict()
-        entry["weaknesses"] = dex.weaknesses(p.label)
-        entry["resistances"] = dex.resistances(p.label)
-        predictions.append(entry)
+    if ident.label:
+        head = ident.to_dict()
+        head["name"] = ident.label
+        head["weaknesses"] = dex.weaknesses(ident.label)
+        head["resistances"] = dex.resistances(ident.label)
+        predictions.append(head)
+    for alt in ident.alternatives:
+        alt = dict(alt)
+        alt["weaknesses"] = dex.weaknesses(alt["name"])
+        alt["resistances"] = dex.resistances(alt["name"])
+        predictions.append(alt)
 
     body = {
         "predictions": predictions,
-        "confident": result.is_confident,
-        "elapsed_ms": round(result.elapsed_ms),
+        "confident": ident.is_confident,
+        "source": ident.source,
+        "card_text": ident.card_text,
+        "card_found": ident.card_found,
+        "elapsed_ms": round(ident.elapsed_ms),
     }
 
     if payload.get("want_preview"):
@@ -354,6 +368,19 @@ HTML = r"""<!DOCTYPE html>
     letter-spacing: .5px;
     line-height: 1.6;
     margin-bottom: 4px;
+  }
+
+  .source-tag {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 6px;
+    color: #1a5a1a;
+    letter-spacing: .5px;
+    margin-bottom: 4px;
+    min-height: 8px;
+  }
+  .source-tag.from-card {
+    color: var(--phosphor2);
+    text-shadow: 0 0 6px var(--phosphor2);
   }
 
   .matchup-row {
@@ -837,6 +864,7 @@ HTML = r"""<!DOCTYPE html>
       <!-- result state -->
       <div class="result-view" id="resultView">
         <div class="low-conf" id="lowConf" style="display:none"></div>
+        <div class="source-tag" id="sourceTag"></div>
         <div class="mon-header">
           <div>
             <div class="mon-name" id="monName">---</div>
@@ -942,7 +970,8 @@ async function classify(b64) {
       el.classList.add('show');
     }
     if (data.predictions && data.predictions.length) {
-      showResult(data.predictions, data.confident, data.elapsed_ms);
+      showResult(data.predictions, data.confident, data.elapsed_ms,
+                 data.source, data.card_text);
     }
   } catch (e) {
     notify('SCAN ERROR');
@@ -1002,13 +1031,26 @@ function handleFile(file) {
 })();
 
 // ── Show result ──
-function showResult(preds, confident, elapsedMs) {
+function showResult(preds, confident, elapsedMs, source, cardText) {
   currentPred = preds[0];
   const p = preds[0];
   const s = p.stats || {};
 
   document.getElementById('idleMsg').style.display = 'none';
   document.getElementById('resultView').classList.add('show');
+
+  // Say which path answered. Reading the name off a card is a different kind
+  // of evidence from classifying the picture, and worth showing plainly.
+  const src = document.getElementById('sourceTag');
+  if (source === 'card') {
+    src.textContent = 'READ FROM CARD: "' + (cardText || '') + '"';
+    src.className = 'source-tag from-card';
+  } else if (source === 'model') {
+    src.textContent = 'IMAGE MATCH';
+    src.className = 'source-tag';
+  } else {
+    src.textContent = '';
+  }
 
   const lc = document.getElementById('lowConf');
   if (confident === false) {

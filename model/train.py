@@ -221,7 +221,10 @@ def main() -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     timm_name, native_size = config.ARCHITECTURES[args.arch]
     img_size = args.img_size or native_size
-    out_path = args.out or (config.WEIGHTS_DIR / f"best_model_{args.arch}.pth")
+    # Checkpoints from a run with no validation set are written under
+    # last_model_* rather than best_model_*, so they cannot be auto-selected
+    # by the apps ahead of a model that was actually validated.
+    out_path = args.out
 
     with open(config.LABEL_MAP_PATH, encoding="utf-8") as fh:
         label_map = json.load(fh)
@@ -236,6 +239,9 @@ def main() -> int:
         raise SystemExit(f"No training images found under {args.images}")
 
     train_samples, val_samples = stratified_split(by_class, args.val_split, args.seed)
+    if out_path is None:
+        prefix = "best" if val_samples else "last"
+        out_path = config.WEIGHTS_DIR / f"{prefix}_model_{args.arch}.pth"
     singletons = sum(1 for v in by_class.values() if len(v) == 1)
     sprite_pool = [p for paths in by_class.values() for p in paths[:1]]
 
@@ -338,7 +344,7 @@ def main() -> int:
         improved = val_top1 > best_acc if len(val_ds) else True
         if improved:
             best_acc = max(best_acc, val_top1)
-            flag = "  <- best" if len(val_ds) else "  <- saved"
+            flag = "  <- best" if len(val_ds) else "  <- saved (unvalidated)"
             save_checkpoint(out_path, model, {
                 "arch": args.arch,
                 "img_size": img_size,

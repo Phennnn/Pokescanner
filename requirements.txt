@@ -18,3 +18,8 @@ opencv-python>=4.8
 # UIs
 gradio>=4.0            # app/app.py
 flask>=3.0             # app/pokedex.py
+
+# Card reading. Optional: without an OCR engine the scanner still works, it
+# just falls back to the classifier on cards instead of reading the name.
+# RapidOCR is pip-only and needs no system binary, unlike Tesseract.
+rapidocr-onnxruntime>=1.3   # pokescanner/cards.py

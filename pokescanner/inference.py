@@ -214,6 +214,10 @@ class PokemonClassifier:
         self.val_accuracy = meta.get("val_accuracy")
 
         if verbose:
+            if not self.val_accuracy:
+                print(f"[pokescanner] WARNING: {self.weights.name} reports no "
+                      f"validation accuracy, so it was never checked against "
+                      f"held-out data. Set POKESCANNER_WEIGHTS to pick another.")
             acc = f", val acc {self.val_accuracy:.1%}" if self.val_accuracy else ""
             print(f"[pokescanner] {self.arch} @ {self.img_size}px on "
                   f"{self.device}, {self.num_classes} classes, "

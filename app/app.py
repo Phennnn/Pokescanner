@@ -22,7 +22,7 @@ import gradio as gr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pokescanner import dex                            # noqa: E402
+from pokescanner import cards, dex, identify           # noqa: E402
 from pokescanner.inference import PokemonClassifier    # noqa: E402
 
 MAX_TEAM = 6

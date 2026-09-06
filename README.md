@@ -32,10 +32,10 @@ cluttered background then blurred, dimmed, noised and JPEG-compressed), using
 
 | inference pipeline | top-1 | top-5 | mean confidence |
 |---|---|---|---|
-| `legacy` — resize the whole frame to a square | 52.0% | 65.1% | 17.4% |
-| `letterbox` — aspect-preserving, no cropping | 42.4% | 55.5% | 14.2% |
-| **`isolate` — crop to the subject, then letterbox** | **72.4%** | **80.7%** | **25.6%** |
-| `isolate+bg` — also erase outside the silhouette | 68.1% | 79.5% | 20.8% |
+| `legacy`, resize the whole frame to a square | 52.0% | 65.1% | 17.4% |
+| `letterbox`, aspect-preserving, no cropping | 42.4% | 55.5% | 14.2% |
+| **`isolate`, crop to the subject, then letterbox** | **72.4%** | **80.7%** | **25.6%** |
+| `isolate+bg`, also erase outside the silhouette | 68.1% | 79.5% | 20.8% |
 
 **+20.4 points of top-1 with no retraining.** Reproduce it with:
 
@@ -45,12 +45,55 @@ python tools/benchmark.py --n 809 --views 4
 
 Two honest caveats. These sprites were in the training set, so every row is
 inflated in absolute terms; what transfers is the ordering and the size of the
-gaps. And the backgrounds are procedural, not photographs — drop real photos
+gaps. And the backgrounds are procedural, not photographs. Drop real photos
 into `data/backgrounds/` and the harness will use those instead.
 
 Note that plain letterboxing is *worse* than the old squash. Preserving aspect
 ratio while keeping the whole cluttered frame just shrinks the subject further.
 The cropping is what does the work.
+
+---
+
+## Reading cards instead of guessing at them
+
+A trading card has the species name printed on it. Reading that text beats
+classifying the artwork, because the classifier has to separate 809 lookalike
+creatures from a handful of sprites each, while the text just says "Charizard".
+
+Measured on 30 real cards from `api.pokemontcg.io`, each one turned into
+something a webcam would see (perspective tilt, cluttered desk behind it, foil
+glare, uneven light, blur, sensor noise, JPEG):
+
+| path | top-1 | time |
+|---|---|---|
+| **card OCR** | **86.7%** | 2.7s |
+| the classifier | 3.3% | 1.1s |
+
+Reproduce with `python tools/benchmark_cards.py --n 30`.
+
+The classifier is not merely worse on cards, it is confidently wrong, which is
+why the scan reads the text first and only falls back to the model when there
+is no name to read. On clean card scans spanning 1999 Base Set to Sun & Moon,
+OCR gets 36/36.
+
+What makes it hold up:
+
+- **A fixed vocabulary.** OCR on a glossy angled card returns things like
+  "Charitard". Matching against the known 809 names repairs that, because there
+  is usually exactly one species within a small edit distance.
+- **The card name is the biggest text.** Candidate tokens are weighted by
+  height relative to the largest text in view, squared.
+- **The evolution line is skipped.** "Evolves from Charmeleon" contains a real
+  species name that OCR reads perfectly, and it used to beat a slightly misread
+  "Charizard".
+- **A cascade that verifies itself.** Rather than trusting card detection, each
+  view is tried in order of cost and accepted only when OCR actually finds a
+  species in it: rectified name strip, raw frame name strip, then the whole
+  frame, stopping at the first hit and bounded by a time budget.
+
+OCR is optional. With no engine installed everything still runs, it just always
+uses the classifier.
+
 
 ---
 
@@ -79,7 +122,7 @@ POKESCANNER_WEIGHTS=best_model_convnext_tiny.pth python app/pokedex.py
 |---|---|---|
 | **`app/pokedex.py`** | Flask, `localhost:5000` | The flagship. CRT scanlines, phosphor green, typewriter name reveal, physical device shell. Webcam scan, file picker, drag and drop, or paste. Shows type matchups, a team overlay with coverage analysis, and a thumbnail of what the model actually received. |
 | **`app/app.py`** | Gradio, `localhost:7860` | Upload or webcam, full stat card, team builder. Team state is per-session, so it is safe to deploy publicly. |
-| **`app/scanner.py`** | OpenCV window | `SPACE` scan · `A` add · `C` clear · `T` team analysis · `I` toggle isolation · `S` save the scan · `Q` quit. The targeting brackets are the region that gets classified. |
+| **`app/scanner.py`** | OpenCV window | `SPACE` scan · `A` add · `C` clear · `T` team analysis · `I` toggle isolation · `M` scan mode · `S` save the scan · `Q` quit. The targeting brackets are the region that gets read. |
 
 ---
 
@@ -107,11 +150,15 @@ pokescanner/          the shared core - all three UIs import this
 ├── vision.py         subject isolation and letterboxing (the domain-gap fix)
 ├── inference.py      PokemonClassifier: load, TTA, multi-frame, calibration
 ├── dex.py            stats, type chart, matchups, team analysis
+├── cards.py          card detection, OCR, fuzzy name matching
+├── identify.py       read the card first, fall back to the classifier
 └── synth.py          synthetic scene generation (training + benchmarking)
 
 app/                  pokedex.py · app.py · scanner.py
 model/                train.py · evaluate.py · weights/
-tools/                benchmark.py · selftest.py
+tools/                benchmark.py · benchmark_cards.py · selftest.py
+                      fetch_sprites.py · make_colab_bundle.py
+notebooks/            train_colab.ipynb
 data/                 raw/ · processed/ · images/ · backgrounds/ (optional)
 ```
 
@@ -119,10 +166,20 @@ data/                 raw/ · processed/ · images/ · backgrounds/ (optional)
 
 ## Training
 
+Open `notebooks/train_colab.ipynb` in Colab, set the runtime to a T4, and run
+it top to bottom. It builds the dataset, trains, evaluates and hands back the
+weights. Locally:
+
 ```bash
+python tools/fetch_sprites.py                             # ~9 images per class
 python model/train.py --arch convnext_tiny --epochs 30
 python model/train.py --arch efficientnet_b2 --resume
 ```
+
+`tools/fetch_sprites.py` pulls front, back, shiny, official artwork, HOME
+renders and three generations of game sprites from the PokeAPI repository. The
+artwork and HOME renders matter most: they are large and shaded, much closer to
+a photo of a figure than a 96x96 game sprite. Roughly 7,000 images from 809.
 
 What changed from the original notebook recipe:
 
@@ -155,12 +212,18 @@ number means anything.
 
 ## Data
 
+Coverage is **Gen 1 to 7**, 809 classes, complete. Gen 8 (Galar) and Gen 9
+(Paldea) are absent, which is 216 more species. PokeAPI carries all 1025, so
+adding them is a download plus a retrain. Worth doing after accuracy, since
+adding thinly covered classes to a data-starved model drags the rest down.
+
 | Dataset | Source | Use |
 |---|---|---|
 | Pokémon stats | [rounakbanik/pokemon](https://kaggle.com/datasets/rounakbanik/pokemon) | Base stats, generation, classification |
 | Pokémon images + types | [vishalsubbiah/pokemon-images-and-types](https://kaggle.com/datasets/vishalsubbiah/pokemon-images-and-types) | Sprites and typing for all 809 classes |
 | Extra images | [hlrhegemony/pokemon-image-dataset](https://kaggle.com/datasets/hlrhegemony/pokemon-image-dataset) | Additional training data |
-| PokeAPI sprites | [PokeAPI/sprites](https://github.com/PokeAPI/sprites) | Front/back/shiny variants |
+| PokeAPI sprites | [PokeAPI/sprites](https://github.com/PokeAPI/sprites) | Front, back, shiny, artwork, HOME renders (`tools/fetch_sprites.py`) |
+| Card images | [pokemontcg.io](https://pokemontcg.io) | Evaluating the card reader |
 
 The stats CSV covers 801 species and is keyed by species name, while the class
 labels include form variants such as `giratina-altered` and `aegislash-blade`.
@@ -179,8 +242,8 @@ the UI rather than shown as zeros.
 python tools/selftest.py
 ```
 
-Fifteen checks over the type chart, the name matching and the image
-preparation. No model weights and no pytest required. Writing these turned up
+Twenty-one checks over the type chart, the name matching, the image
+preparation and the card reader. No model weights and no pytest required. Writing these turned up
 two live bugs: `Farfetch'd` normalising to `farfetch-d` instead of `farfetchd`,
 and small sprites having their alpha bounding box silently rejected.
 
@@ -192,10 +255,12 @@ and small sprites having their alpha bounding box silently rejected.
 - [x] Subject isolation before inference
 - [x] Background augmentation during training
 - [x] ConvNeXt support
+- [x] Card OCR, so cards are read rather than guessed at
+- [x] More images per class from PokeAPI
 - [ ] Train ConvNeXt-Tiny with background augmentation and compare
-- [ ] Real card photographs to close the remaining domain gap
+- [ ] Look up set, rarity and market price once a card is identified
 - [ ] Deploy to HuggingFace Spaces
-- [ ] Gen 8/9 (expand beyond 809 classes)
+- [ ] Gen 8/9 (216 more species, all available from PokeAPI)
 
 ---
 

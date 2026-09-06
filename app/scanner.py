@@ -8,6 +8,7 @@ Controls
     C       clear the team
     T       team type analysis on/off
     I       subject isolation on/off (see what the model actually receives)
+    M       cycle scan mode: auto (read card, else classify) / card / model
     S       save the last scan to reports/scans/
     Q       quit
 
@@ -28,7 +29,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pokescanner import config, dex                    # noqa: E402
+from pokescanner import cards, config, dex, identify   # noqa: E402
 from pokescanner.inference import PokemonClassifier    # noqa: E402
 
 SCAN_FRAMES = 5
@@ -98,16 +99,16 @@ def draw_panel(frame, result, team, show_team_analysis, isolate_on):
     y = 28
     text(frame, "POKESCANNER", (px, y), 0.55, ACCENT, 2)
     y += 22
-    text(frame, f"isolate {'ON' if isolate_on else 'OFF'}", (px, y), 0.34, DIM)
+    text(frame, f"isolate {'ON' if isolate_on else 'OFF'}   "
+                f"ocr {cards.OCR.kind}", (px, y), 0.34, DIM)
     y += 22
 
-    if result is None or not result.predictions:
+    if result is None or not result.label:
         text(frame, "Aim inside the brackets", (px, y), 0.38, DIM)
         text(frame, "and press SPACE", (px, y + 16), 0.38, DIM)
         y += 46
     else:
-        top = result.predictions[0]
-        conf = top.confidence
+        conf = result.confidence
         conf_color = GOOD if conf > 0.5 else WARN if conf > 0.25 else (70, 70, 220)
 
         bar(frame, px, y, PANEL_W - 28, 14, conf, conf_color)
@@ -118,10 +119,17 @@ def draw_panel(frame, result, team, show_team_analysis, isolate_on):
             text(frame, "NOT SURE - best guess:", (px, y), 0.36, (80, 170, 250))
             y += 18
 
-        text(frame, top.display_name[:20], (px, y + 14), 0.62, FG, 2)
+        text(frame, result.display_name[:20], (px, y + 14), 0.62, FG, 2)
         y += 30
 
-        s = top.stats
+        # say which path answered: reading the card is a different kind of
+        # evidence from classifying the picture, and the user should know
+        if result.source == "card":
+            label = f"READ FROM CARD: \"{result.card_text}\""
+            text(frame, label[:34], (px, y), 0.33, (120, 220, 140))
+            y += 18
+
+        s = result.stats
         types = s.get("types", [])
         if types:
             tx = px
@@ -152,7 +160,7 @@ def draw_panel(frame, result, team, show_team_analysis, isolate_on):
             text(frame, "* LEGENDARY", (px, y + 10), 0.42, (0, 215, 255))
             y += 20
 
-        weak = dex.weaknesses(top.label)
+        weak = dex.weaknesses(result.label)
         if weak:
             worst = sorted(weak.items(), key=lambda kv: -kv[1])[:4]
             text(frame, "WEAK TO", (px, y + 10), 0.32, DIM)
@@ -165,16 +173,16 @@ def draw_panel(frame, result, team, show_team_analysis, isolate_on):
                 tx += 68
             y += 24
 
-        if len(result.predictions) > 1:
+        if result.alternatives:
             text(frame, "also considered", (px, y + 10), 0.32, DIM)
             y += 20
-            for alt in result.predictions[1:4]:
-                text(frame, f"{alt.display_name[:18]}  {alt.percent:.1f}%",
+            for alt in result.alternatives[:3]:
+                text(frame, f"{alt['display_name'][:18]}  {alt['confidence']:.1f}%",
                      (px, y), 0.34, (128, 126, 140))
                 y += 15
             y += 6
 
-        text(frame, f"{result.frames} frames  {result.elapsed_ms:.0f} ms",
+        text(frame, f"via {result.source}  {result.elapsed_ms:.0f} ms",
              (px, y + 8), 0.31, (86, 84, 96))
         y += 22
 
@@ -209,8 +217,8 @@ def draw_panel(frame, result, team, show_team_analysis, isolate_on):
             text(frame, "none - well balanced", (px, ty + 1), 0.32, GOOD)
 
     text(frame, "SPACE scan  A add  C clear", (x0 + 8, h - 26), 0.31, (92, 90, 104))
-    text(frame, "T team  I isolate  S save  Q quit", (x0 + 8, h - 12), 0.31,
-         (92, 90, 104))
+    text(frame, "T team  I isolate  M mode  S save  Q quit", (x0 + 8, h - 12),
+         0.31, (92, 90, 104))
 
 
 # -- main ---------------------------------------------------------------------
@@ -236,6 +244,7 @@ def main() -> int:
     last_scan_at = 0.0
     show_team_analysis = False
     last_crop = None
+    scan_mode = "auto"      # auto | card | model
 
     while True:
         ok, frame = cap.read()
@@ -267,23 +276,28 @@ def main() -> int:
                     crops.append(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
             if crops:
                 last_crop = crops[-1]
-                result = clf.predict_frames(crops)
-                top = result.top
-                mark = "" if result.is_confident else "  (low confidence)"
-                print(f"  -> {top.display_name} {top.percent:.1f}%{mark}")
+                result = identify.identify(crops[-1], clf, mode=scan_mode)
+                if result.label:
+                    mark = "" if result.is_confident else "  (low confidence)"
+                    via = (f' [read "{result.card_text}" off the card]'
+                           if result.source == "card" else "")
+                    print(f"  -> {result.display_name} "
+                          f"{result.confidence * 100:.1f}%{mark}{via}")
+                else:
+                    print("  -> nothing recognised")
 
         elif key == ord("a"):
-            if result and result.top:
-                label = result.top.label
+            if result and result.label:
+                label = result.label
                 if not result.is_confident:
                     print("  too unsure to add - scan again")
                 elif len(team) >= 6:
                     print("  team is full")
                 elif label in team:
-                    print(f"  {result.top.display_name} is already on the team")
+                    print(f"  {result.display_name} is already on the team")
                 else:
                     team.append(label)
-                    print(f"  added {result.top.display_name} ({len(team)}/6)")
+                    print(f"  added {result.display_name} ({len(team)}/6)")
 
         elif key == ord("c"):
             team.clear()
@@ -291,6 +305,11 @@ def main() -> int:
 
         elif key == ord("t"):
             show_team_analysis = not show_team_analysis
+
+        elif key == ord("m"):
+            order = ["auto", "card", "model"]
+            scan_mode = order[(order.index(scan_mode) + 1) % len(order)]
+            print(f"  scan mode: {scan_mode}")
 
         elif key == ord("i"):
             clf.isolate = not clf.isolate
@@ -300,7 +319,7 @@ def main() -> int:
             out = config.ROOT / "reports" / "scans"
             out.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            name = result.top.label if result.top else "unknown"
+            name = result.label or "unknown"
             cv2.imwrite(str(out / f"{stamp}_{name}_raw.jpg"),
                         cv2.cvtColor(last_crop, cv2.COLOR_RGB2BGR))
             prepared = np.asarray(clf.prepare(last_crop))

@@ -18,7 +18,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pokescanner import config, dex, vision  # noqa: E402
+from pokescanner import cards, config, dex, vision  # noqa: E402
 
 CHECKS = []
 
@@ -180,6 +180,75 @@ def prepare_survives_a_degenerate_image():
     # a single flat colour has no subject at all; must not raise
     out = vision.prepare(Image.new("RGB", (64, 64), (128, 128, 128)), 224)
     assert out.size == (224, 224)
+
+
+# -- card reading -------------------------------------------------------------
+@check
+def ocr_typos_resolve_to_the_right_species():
+    """The whole point of matching against a fixed vocabulary."""
+    for typo, expected in [("Charitard", "charizard"), ("Charlzard", "charizard"),
+                           ("PIKACHU", "pikachu"), ("Bulbasour", "bulbasaur"),
+                           ("Gengarr", "gengar"), ("Snorlaxx", "snorlax")]:
+        label, score = cards.match_species(typo)
+        assert label == expected, f"{typo!r} -> {label!r} ({score:.2f})"
+
+
+@check
+def unrelated_words_do_not_match_a_species():
+    for word in ["Trainer", "Weakness", "Resistance", "Retreat", "Illustrator"]:
+        label, _ = cards.match_species(word)
+        assert label is None, f"{word!r} wrongly matched {label!r}"
+
+
+@check
+def evolution_line_is_ignored():
+    """'Evolves from Charmeleon' must not beat the card's own name."""
+    import numpy as np
+
+    def box(x, y, w, h):
+        return np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], np.float32)
+
+    boxes = [
+        cards.TextBox("Charizard", 0.99, box(20, 10, 260, 46)),   # the name
+        cards.TextBox("Evolves from Charmeleon", 0.99, box(20, 62, 200, 14)),
+    ]
+    label, _score, _raw = cards._best_species(boxes, 120)
+    assert label == "charizard", label
+
+
+@check
+def card_reading_degrades_without_an_ocr_engine():
+    """No engine installed must return an empty reading, not raise."""
+    original = cards.OCR._kind
+    try:
+        cards.OCR._kind = "none"
+        cards.OCR._engine = None
+        reading = cards.read_card(Image.new("RGB", (200, 280), "white"))
+        assert reading.label is None and reading.score == 0.0
+    finally:
+        cards.OCR._kind = original
+        cards.OCR._engine = None
+
+
+@check
+def card_quad_is_found_and_rectified():
+    import numpy as np
+    scene = np.full((600, 800, 3), 60, np.uint8)
+    # a card-shaped bright rectangle, 63x88 proportions
+    scene[120:120 + 352, 260:260 + 252] = 240
+    corners = cards.find_card(scene)
+    assert corners is not None, "card quad not found"
+    flat = cards.rectify(scene, corners)
+    assert flat.size == (cards.CARD_W, cards.CARD_H)
+
+
+@check
+def artwork_window_is_not_mistaken_for_the_card():
+    """A near-square inner panel must be rejected by the ratio filter."""
+    import numpy as np
+    scene = np.full((600, 800, 3), 60, np.uint8)
+    scene[200:200 + 260, 300:300 + 280] = 240      # ratio ~0.93, too square
+    assert cards.find_card(scene) is None
 
 
 # -- runner -------------------------------------------------------------------
