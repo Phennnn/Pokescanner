@@ -187,10 +187,24 @@ def _comparable(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", dex.strip_accents(str(text)).lower())
 
 
-def match_species(text: str, min_score: float = 0.72) -> Tuple[Optional[str], float]:
+def _threshold_for(candidate: str) -> float:
+    """Short names need to match more exactly.
+
+    At a fixed ratio, a short word is far easier to hit by accident: the
+    3-letter fragment "eee" scores 0.75 against "eevee", which is enough to
+    turn OCR noise into a confident wrong answer. Longer names carry enough
+    signal that 0.80 is safe.
+    """
+    return 0.88 if len(candidate) <= 6 else 0.80
+
+
+def match_species(text: str, min_score: Optional[float] = None
+                  ) -> Tuple[Optional[str], float]:
     """Best species label for one OCR token, plus a 0..1 match score."""
     key = _comparable(text)
-    if len(key) < 3:
+    # Fewer than four characters is noise, not a name. Every species in the
+    # vocabulary is at least five characters long.
+    if len(key) < 4:
         return None, 0.0
     vocab = _vocabulary()
     if key in vocab:
@@ -199,12 +213,16 @@ def match_species(text: str, min_score: float = 0.72) -> Tuple[Optional[str], fl
     best_label, best_score = None, 0.0
     for candidate, label in vocab.items():
         # cheap length filter before the expensive ratio
-        if abs(len(candidate) - len(key)) > 3:
+        if abs(len(candidate) - len(key)) > max(2, len(key) // 3):
             continue
         score = difflib.SequenceMatcher(None, key, candidate).ratio()
         if score > best_score:
-            best_label, best_score = label, score
-    if best_score >= min_score:
+            best_label, best_score, best_candidate = label, score, candidate
+
+    if best_label is None:
+        return None, 0.0
+    floor = min_score if min_score is not None else _threshold_for(best_candidate)
+    if best_score >= floor:
         return best_label, best_score
     return None, best_score
 
@@ -381,6 +399,7 @@ def read_card(image, detect_card: bool = True,
         # always run the first pass; later ones only while there is time left
         if index and time.perf_counter() - started > time_budget:
             break
+        arr = np.ascontiguousarray(arr)
         boxes = OCR.read(arr)
         seen_text.extend(tb.text for tb in boxes)
         label, score, raw = _best_species(boxes, arr.shape[0])

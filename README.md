@@ -66,7 +66,7 @@ glare, uneven light, blur, sensor noise, JPEG):
 
 | path | top-1 | time |
 |---|---|---|
-| **card OCR** | **86.7%** | 2.7s |
+| **card OCR** | **86.7%** | 1.8s |
 | the classifier | 3.3% | 1.1s |
 
 Reproduce with `python tools/benchmark_cards.py --n 30`.
@@ -78,9 +78,12 @@ OCR gets 36/36.
 
 What makes it hold up:
 
-- **A fixed vocabulary.** OCR on a glossy angled card returns things like
-  "Charitard". Matching against the known 809 names repairs that, because there
-  is usually exactly one species within a small edit distance.
+- **A fixed vocabulary, matched carefully.** OCR on a glossy angled card
+  returns things like "Charitard". Matching against the known 809 names repairs
+  that, because there is usually exactly one species within a small edit
+  distance. The threshold rises for short names and tokens under four
+  characters are rejected outright: the fragment "eee" scores 0.75 against
+  "eevee", which was enough to turn OCR noise into a confident wrong answer.
 - **The card name is the biggest text.** Candidate tokens are weighted by
   height relative to the largest text in view, squared.
 - **The evolution line is skipped.** "Evolves from Charmeleon" contains a real
@@ -90,6 +93,11 @@ What makes it hold up:
   view is tried in order of cost and accepted only when OCR actually finds a
   species in it: rectified name strip, raw frame name strip, then the whole
   frame, stopping at the first hit and bounded by a time budget.
+
+The webcam preview is deliberately not mirrored. A selfie mirror is the wrong
+default for a scanner: it renders every card name backwards, and an early
+version also mirrored the frame that was sent for reading, so cards silently
+fell through to the classifier.
 
 OCR is optional. With no engine installed everything still runs, it just always
 uses the classifier.

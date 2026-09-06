@@ -261,7 +261,8 @@ HTML = r"""<!DOCTYPE html>
     height: 100%;
     object-fit: cover;
     display: block;
-    transform: scaleX(-1);
+    /* deliberately not mirrored: this is a scanner, not a selfie camera, and
+       a mirrored preview shows every card name backwards */
   }
 
   /* CRT scanlines */
@@ -987,13 +988,13 @@ async function doScan() {
 
   // The visible feed is mirrored for the user's benefit; undo that before
   // sending, so the model sees the scene the right way round.
+  // drawImage copies the raw camera buffer and ignores the CSS transform on
+  // the <video>, so the frame is already the right way round. Flipping here
+  // mirrored the text and made card names unreadable.
   const canvas = document.createElement('canvas');
   canvas.width = video.videoWidth || 640;
   canvas.height = video.videoHeight || 480;
-  const ctx = canvas.getContext('2d');
-  ctx.translate(canvas.width, 0);
-  ctx.scale(-1, 1);
-  ctx.drawImage(video, 0, 0);
+  canvas.getContext('2d').drawImage(video, 0, 0);
   await classify(canvas.toDataURL('image/jpeg', .9));
 }
 

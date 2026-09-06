@@ -250,8 +250,9 @@ def main() -> int:
         ok, frame = cap.read()
         if not ok:
             break
-        frame = cv2.flip(frame, 1)
-
+        # Not mirrored on purpose: this is a scanner, not a selfie camera.
+        # A mirrored frame shows every card name backwards and makes the OCR
+        # path fail on cards it would otherwise read.
         box = roi_box(frame)
         draw_brackets(frame, box, (time.time() - last_scan_at) < 0.6)
         draw_panel(frame, result, team, show_team_analysis, clf.isolate)
@@ -270,7 +271,6 @@ def main() -> int:
                 ok2, frame2 = cap.read()
                 if not ok2:
                     continue
-                frame2 = cv2.flip(frame2, 1)
                 crop = frame2[y1:y2, x1:x2]
                 if crop.size:
                     crops.append(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
