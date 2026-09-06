@@ -51,3 +51,12 @@ kaggle.json
 # gradio
 gradio_cached_examples/
 flagged/
+
+# generated reports, benchmark output and saved scans
+reports/
+
+# optional real background photos for augmentation (user supplied, can be large)
+data/backgrounds/
+
+# archives that should not be in git
+*.zip

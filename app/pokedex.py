@@ -6,109 +6,108 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 import base64
+import binascii
 import io
-import json
+import sys
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn.functional as F
-import timm
 from flask import Flask, jsonify, render_template_string, request
 from PIL import Image
-from torchvision import transforms
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-ROOT      = Path(__file__).resolve().parent.parent
-WEIGHTS   = ROOT / "model" / "weights" / "best_model_b2.pth"
-LABEL_MAP = ROOT / "data" / "processed" / "label_map.json"
-STATS_CSV = ROOT / "data" / "raw" / "pokemon_stats.csv"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-IMG_SIZE  = 260
-MEAN      = [0.485, 0.456, 0.406]
-STD       = [0.229, 0.224, 0.225]
-TOP_K     = 3
+from pokescanner import cards, dex, identify
+from pokescanner.inference import PokemonClassifier
 
-# ── TTA ───────────────────────────────────────────────────────────────────────
-tta_transforms = [
-    transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)),                              transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
-    transforms.Compose([transforms.Resize((IMG_SIZE+20, IMG_SIZE+20)), transforms.CenterCrop(IMG_SIZE), transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
-    transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)), transforms.RandomHorizontalFlip(p=1.0), transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
-    transforms.Compose([transforms.Resize((IMG_SIZE+30, IMG_SIZE+30)), transforms.CenterCrop(IMG_SIZE), transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
-]
+TOP_K = 4
+MAX_UPLOAD_BYTES = 12 * 1024 * 1024
 
-# ── Load model ────────────────────────────────────────────────────────────────
 print("Loading model...")
-with open(LABEL_MAP) as f:
-    label_map = json.load(f)
-idx_to_label = label_map["idx_to_label"]
-NUM_CLASSES  = label_map["num_classes"]
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model  = timm.create_model("efficientnet_b2", pretrained=False, num_classes=NUM_CLASSES)
-model.load_state_dict(torch.load(WEIGHTS, map_location=device))
-model.eval().to(device)
-print(f"Model ready on {device}")
-
-# ── Stats ─────────────────────────────────────────────────────────────────────
-stats_db = {}
-if STATS_CSV.exists():
-    df = pd.read_csv(STATS_CSV)
-    for _, row in df.iterrows():
-        key = str(row["name"]).strip().lower().replace(" ", "-").replace("'","").replace("'","")
-        stats_db[key] = {
-            "hp":          int(row.get("hp", 0)),
-            "attack":      int(row.get("attack", 0)),
-            "defense":     int(row.get("defense", 0)),
-            "sp_attack":   int(row.get("sp_attack", 0)),
-            "sp_defense":  int(row.get("sp_defense", 0)),
-            "speed":       int(row.get("speed", 0)),
-            "base_total":  int(row.get("base_total", 0)),
-            "type1":       str(row.get("type1", "")).lower().strip(),
-            "type2":       str(row.get("type2", "")).lower().strip(),
-            "legendary":   bool(row.get("is_legendary", 0)),
-            "generation":  int(row.get("generation", 0)),
-            "pokedex_number": int(row.get("pokedex_number", 0)),
-            "capture_rate": str(row.get("capture_rate", "?")),
-            "classfication": str(row.get("classfication", "")),
-            "height_m":    float(row.get("height_m", 0) or 0),
-            "weight_kg":   float(row.get("weight_kg", 0) or 0),
-        }
+CLASSIFIER = PokemonClassifier()
+CLASSIFIER.warmup()
 
 # ── Flask ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
+
 
 @app.route("/")
 def index():
     return render_template_string(HTML)
 
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "arch": CLASSIFIER.arch,
+        "img_size": CLASSIFIER.img_size,
+        "device": str(CLASSIFIER.device),
+        "classes": CLASSIFIER.num_classes,
+        "isolate": CLASSIFIER.isolate,
+        "ocr": cards.OCR.kind,
+    })
+
+
+def _decode(data: str) -> Image.Image:
+    payload = data.split(",", 1)[1] if "," in data else data
+    return Image.open(io.BytesIO(base64.b64decode(payload)))
+
+
 @app.route("/predict", methods=["POST"])
 def predict():
-    data = request.json.get("image", "")
+    payload = request.get_json(silent=True) or {}
+    data = payload.get("image", "")
     if not data:
         return jsonify({"error": "no image"}), 400
 
-    # decode base64 image from browser
-    img_bytes = base64.b64decode(data.split(",")[1] if "," in data else data)
-    pil_img   = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    try:
+        pil_img = _decode(data)
+    except (binascii.Error, ValueError, OSError):
+        return jsonify({"error": "could not read that image"}), 400
 
-    tensors = torch.stack([t(pil_img) for t in tta_transforms]).to(device)
-    with torch.no_grad():
-        probs = F.softmax(model(tensors), dim=1).mean(dim=0)
+    CLASSIFIER.isolate = bool(payload.get("isolate", CLASSIFIER.isolate))
+    mode = payload.get("mode", "auto")
+    if mode not in ("auto", "card", "model"):
+        mode = "auto"
 
-    top_probs, top_idxs = torch.topk(probs, TOP_K)
-    results = []
-    for prob, idx in zip(top_probs.cpu().numpy(), top_idxs.cpu().numpy()):
-        name = idx_to_label[str(idx)]
-        s    = stats_db.get(name, {})
-        results.append({
-            "name":       name,
-            "confidence": round(float(prob) * 100, 1),
-            "stats":      s,
-        })
+    ident = identify.identify(pil_img, CLASSIFIER, mode=mode, top_k=TOP_K)
 
-    return jsonify({"predictions": results})
+    predictions = []
+    if ident.label:
+        head = ident.to_dict()
+        head["name"] = ident.label
+        head["weaknesses"] = dex.weaknesses(ident.label)
+        head["resistances"] = dex.resistances(ident.label)
+        predictions.append(head)
+    for alt in ident.alternatives:
+        alt = dict(alt)
+        alt["weaknesses"] = dex.weaknesses(alt["name"])
+        alt["resistances"] = dex.resistances(alt["name"])
+        predictions.append(alt)
+
+    body = {
+        "predictions": predictions,
+        "confident": ident.is_confident,
+        "source": ident.source,
+        "card_text": ident.card_text,
+        "card_found": ident.card_found,
+        "elapsed_ms": round(ident.elapsed_ms),
+    }
+
+    if payload.get("want_preview"):
+        buf = io.BytesIO()
+        CLASSIFIER.prepare(pil_img).save(buf, "JPEG", quality=82)
+        body["model_input"] = ("data:image/jpeg;base64,"
+                               + base64.b64encode(buf.getvalue()).decode())
+
+    return jsonify(body)
+
+
+@app.route("/team/analyse", methods=["POST"])
+def analyse_team():
+    payload = request.get_json(silent=True) or {}
+    labels = [str(x) for x in (payload.get("team") or [])][:6]
+    return jsonify(dex.team_report(labels))
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
@@ -262,7 +261,8 @@ HTML = r"""<!DOCTYPE html>
     height: 100%;
     object-fit: cover;
     display: block;
-    transform: scaleX(-1);
+    /* deliberately not mirrored: this is a scanner, not a selfie camera, and
+       a mirrored preview shows every card name backwards */
   }
 
   /* CRT scanlines */
@@ -342,6 +342,88 @@ HTML = r"""<!DOCTYPE html>
   }
   .scan-btn:active { transform: translateY(2px); border-bottom-width: 1px; }
   .scan-btn:hover  { background: linear-gradient(180deg, #333 0%, #1a1a1a 100%); }
+  .scan-btn.alt    { flex: 0 0 74px; color: var(--amber); text-shadow: 0 0 8px var(--amber); }
+
+  /* drop target state while a file is dragged over the screen */
+  .screen-wrap.dropping { outline: 2px dashed var(--amber); outline-offset: 3px; }
+
+  /* the frame the model actually receives, shown bottom-left of the screen */
+  .model-input {
+    position: absolute;
+    left: 6px; bottom: 6px;
+    width: 54px; height: 54px;
+    border: 1px solid #0a3a0a;
+    border-radius: 2px;
+    object-fit: cover;
+    opacity: .85;
+    display: none;
+    z-index: 4;
+  }
+  .model-input.show { display: block; }
+
+  .low-conf {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 6px;
+    color: var(--amber);
+    text-shadow: 0 0 6px var(--amber);
+    letter-spacing: .5px;
+    line-height: 1.6;
+    margin-bottom: 4px;
+  }
+
+  .source-tag {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 6px;
+    color: #1a5a1a;
+    letter-spacing: .5px;
+    margin-bottom: 4px;
+    min-height: 8px;
+  }
+  .source-tag.from-card {
+    color: var(--phosphor2);
+    text-shadow: 0 0 6px var(--phosphor2);
+  }
+
+  .matchup-row {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    border-top: 1px solid #0a3a0a;
+    padding-top: 5px;
+  }
+  .matchup-line { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+  .matchup-lbl {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 6px;
+    color: #1a5a1a;
+    letter-spacing: .5px;
+    min-width: 42px;
+  }
+  .mult-pill {
+    font-family: 'VT323', monospace;
+    font-size: 11px;
+    line-height: 1;
+    padding: 2px 4px;
+    border-radius: 2px;
+    color: #051405;
+    font-weight: 700;
+  }
+
+  .team-analysis {
+    border-top: 1px solid #0a3a0a;
+    padding-top: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .ta-line { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+  .ta-lbl {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 6px;
+    color: #1a5a1a;
+    letter-spacing: .5px;
+  }
+  .ta-ok { font-family: 'VT323', monospace; font-size: 13px; color: var(--phosphor); }
 
   .dpad {
     width: 50px; height: 50px;
@@ -746,11 +828,14 @@ HTML = r"""<!DOCTYPE html>
         <div class="bracket bl"></div>
         <div class="bracket br"></div>
         <div class="crosshair"></div>
+        <img class="model-input" id="modelInput" alt="model input">
       </div>
     </div>
 
     <div class="btn-row">
       <button class="scan-btn" onclick="doScan()">[ SCAN ]</button>
+      <button class="scan-btn alt" onclick="document.getElementById('fileInput').click()">[ FILE ]</button>
+      <input type="file" id="fileInput" accept="image/*" hidden onchange="handleFile(this.files[0])">
       <div class="dpad">
         <div></div><div class="dpad-btn"></div><div></div>
         <div class="dpad-btn"></div><div class="dpad-btn"></div><div class="dpad-btn"></div>
@@ -779,6 +864,8 @@ HTML = r"""<!DOCTYPE html>
 
       <!-- result state -->
       <div class="result-view" id="resultView">
+        <div class="low-conf" id="lowConf" style="display:none"></div>
+        <div class="source-tag" id="sourceTag"></div>
         <div class="mon-header">
           <div>
             <div class="mon-name" id="monName">---</div>
@@ -797,6 +884,8 @@ HTML = r"""<!DOCTYPE html>
 
         <div class="meta-row" id="metaRow"></div>
 
+        <div class="matchup-row" id="matchupRow"></div>
+
         <div class="others-row" id="othersRow"></div>
       </div>
 
@@ -804,6 +893,7 @@ HTML = r"""<!DOCTYPE html>
       <div class="team-overlay" id="teamOverlay">
         <div class="team-title">MY TEAM</div>
         <div class="team-slots" id="teamSlots"></div>
+        <div class="team-analysis" id="teamAnalysis"></div>
       </div>
     </div>
 
@@ -834,6 +924,7 @@ const STAT_COLORS = {
 let currentPred = null;
 let team = [];
 let teamVisible = false;
+let scanning = false;
 
 // ── Webcam ──
 async function initCam() {
@@ -845,41 +936,130 @@ async function initCam() {
 initCam();
 
 // ── Scan ──
-async function doScan() {
-  const video = document.getElementById('webcam');
-  if (!video.srcObject) return notify('NO CAMERA FEED');
-
-  // animate
+function beginScanAnimation() {
   document.getElementById('bigLight').classList.add('scanning');
   const beam = document.getElementById('scanBeam');
   beam.classList.remove('active');
   void beam.offsetWidth;
   beam.classList.add('active');
+}
 
-  // capture frame
+function endScanAnimation() {
+  setTimeout(() => document.getElementById('bigLight').classList.remove('scanning'), 1200);
+}
+
+// Send a data-URL to the backend and render whatever comes back.
+async function classify(b64) {
+  if (scanning) return;
+  scanning = true;
+  beginScanAnimation();
+  try {
+    const res = await fetch('/predict', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image: b64, want_preview: true })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      notify((err.error || 'SCAN FAILED').toUpperCase());
+      return;
+    }
+    const data = await res.json();
+    if (data.model_input) {
+      const el = document.getElementById('modelInput');
+      el.src = data.model_input;
+      el.classList.add('show');
+    }
+    if (data.predictions && data.predictions.length) {
+      showResult(data.predictions, data.confident, data.elapsed_ms,
+                 data.source, data.card_text);
+    }
+  } catch (e) {
+    notify('SCAN ERROR');
+  } finally {
+    scanning = false;
+    endScanAnimation();
+  }
+}
+
+async function doScan() {
+  const video = document.getElementById('webcam');
+  if (!video.srcObject) return notify('NO CAMERA - USE [ FILE ]');
+
+  // The visible feed is mirrored for the user's benefit; undo that before
+  // sending, so the model sees the scene the right way round.
+  // drawImage copies the raw camera buffer and ignores the CSS transform on
+  // the <video>, so the frame is already the right way round. Flipping here
+  // mirrored the text and made card names unreadable.
   const canvas = document.createElement('canvas');
   canvas.width = video.videoWidth || 640;
   canvas.height = video.videoHeight || 480;
   canvas.getContext('2d').drawImage(video, 0, 0);
-  const b64 = canvas.toDataURL('image/jpeg', .85);
-
-  try {
-    const res  = await fetch('/predict', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ image: b64 }) });
-    const data = await res.json();
-    if (data.predictions) showResult(data.predictions);
-  } catch(e) { notify('SCAN ERROR'); }
-
-  setTimeout(() => document.getElementById('bigLight').classList.remove('scanning'), 1200);
+  await classify(canvas.toDataURL('image/jpeg', .9));
 }
 
+// ── File upload / drag and drop ──
+function handleFile(file) {
+  if (!file) return;
+  if (!file.type.startsWith('image/')) return notify('NOT AN IMAGE');
+  if (file.size > 12 * 1024 * 1024) return notify('FILE TOO BIG (12MB MAX)');
+  const reader = new FileReader();
+  reader.onload = () => classify(reader.result);
+  reader.onerror = () => notify('COULD NOT READ FILE');
+  reader.readAsDataURL(file);
+}
+
+(function enableDropTarget() {
+  const wrap = document.querySelector('.screen-wrap');
+  if (!wrap) return;
+  ['dragenter', 'dragover'].forEach(evt => wrap.addEventListener(evt, e => {
+    e.preventDefault();
+    wrap.classList.add('dropping');
+  }));
+  ['dragleave', 'drop'].forEach(evt => wrap.addEventListener(evt, e => {
+    e.preventDefault();
+    wrap.classList.remove('dropping');
+  }));
+  wrap.addEventListener('drop', e => {
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    handleFile(file);
+  });
+  window.addEventListener('paste', e => {
+    const item = [...(e.clipboardData ? e.clipboardData.items : [])]
+      .find(i => i.type.startsWith('image/'));
+    if (item) handleFile(item.getAsFile());
+  });
+})();
+
 // ── Show result ──
-function showResult(preds) {
+function showResult(preds, confident, elapsedMs, source, cardText) {
   currentPred = preds[0];
   const p = preds[0];
   const s = p.stats || {};
 
   document.getElementById('idleMsg').style.display = 'none';
   document.getElementById('resultView').classList.add('show');
+
+  // Say which path answered. Reading the name off a card is a different kind
+  // of evidence from classifying the picture, and worth showing plainly.
+  const src = document.getElementById('sourceTag');
+  if (source === 'card') {
+    src.textContent = 'READ FROM CARD: "' + (cardText || '') + '"';
+    src.className = 'source-tag from-card';
+  } else if (source === 'model') {
+    src.textContent = 'IMAGE MATCH';
+    src.className = 'source-tag';
+  } else {
+    src.textContent = '';
+  }
+
+  const lc = document.getElementById('lowConf');
+  if (confident === false) {
+    lc.textContent = 'LOW CONFIDENCE - FILL MORE OF THE FRAME, ADD LIGHT, OR USE A PLAINER BACKGROUND';
+    lc.style.display = 'block';
+  } else {
+    lc.style.display = 'none';
+  }
 
   // name with typewriter
   const nameEl = document.getElementById('monName');
@@ -940,18 +1120,52 @@ function showResult(preds) {
   const cap  = s.capture_rate || '?';
   const ht   = s.height_m ? s.height_m + 'm' : '?';
   const wt   = s.weight_kg ? s.weight_kg + 'kg' : '?';
-  meta.innerHTML = `
+  meta.innerHTML = s.has_stats === false
+    ? `<div class="meta-item" style="flex:1">NO BASE STATS ON FILE FOR THIS FORM</div>`
+    : `
     <div class="meta-item">GEN<span>${gen}</span></div>
     <div class="meta-item">BST<span>${bst}</span></div>
     <div class="meta-item">CATCH<span>${cap}</span></div>
     <div class="meta-item">HT<span>${ht}</span></div>
     <div class="meta-item">WT<span>${wt}</span></div>`;
 
+  // type matchups
+  renderMatchups(p);
+
   // others
   const others = document.getElementById('othersRow');
   others.innerHTML = preds.slice(1).map(p2 =>
     `<div class="other-item"><span>${p2.name.replace(/-/g,' ').toUpperCase()}</span><span>${p2.confidence}%</span></div>`
   ).join('');
+}
+
+// ── Type matchups ──
+const TYPE_HEX = {
+  normal:'#A8A878', fire:'#FF6B35', water:'#4A9EFF', electric:'#FFD700',
+  grass:'#5DBE6E', ice:'#96D9D6', fighting:'#C22E28', poison:'#A33EA1',
+  ground:'#E2BF65', flying:'#89AAE3', psychic:'#FF6EB4', bug:'#A6B91A',
+  rock:'#B6A136', ghost:'#735797', dragon:'#6F35FC', dark:'#705746',
+  steel:'#B7B7CE', fairy:'#D685AD'
+};
+
+function multPill(type, mult) {
+  const bg = TYPE_HEX[type] || '#888';
+  const suffix = (mult === '' || mult === undefined) ? '' : ` x${mult}`;
+  return `<span class="mult-pill" style="background:${bg}">${type.slice(0,4).toUpperCase()}${suffix}</span>`;
+}
+
+function renderMatchups(p) {
+  const row = document.getElementById('matchupRow');
+  const weak = p.weaknesses || {};
+  const res  = p.resistances || {};
+  const byMult = (a, b) => b[1] - a[1];
+
+  const weakPills = Object.entries(weak).sort(byMult).map(([t, m]) => multPill(t, m)).join('');
+  const resPills  = Object.entries(res).sort((a, b) => a[1] - b[1]).map(([t, m]) => multPill(t, m)).join('');
+
+  row.innerHTML = `
+    <div class="matchup-line"><span class="matchup-lbl">WEAK</span>${weakPills || '<span class="ta-ok">none</span>'}</div>
+    <div class="matchup-line"><span class="matchup-lbl">RESIST</span>${resPills || '<span class="ta-ok">none</span>'}</div>`;
 }
 
 // ── Team ──
@@ -995,7 +1209,36 @@ function renderTeam() {
     }
     slots.appendChild(div);
   }
+  renderTeamAnalysis();
 }
+
+// Coverage report for the current team, computed server-side from the type chart.
+async function renderTeamAnalysis() {
+  const box = document.getElementById('teamAnalysis');
+  if (!box) return;
+  if (!team.length) { box.innerHTML = ''; return; }
+
+  try {
+    const res = await fetch('/team/analyse', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ team: team.map(m => m.name) })
+    });
+    if (!res.ok) return;
+    const r = await res.json();
+
+    const shared = Object.entries(r.weaknesses || {}).filter(([, c]) => c >= 2);
+    const sharedPills = shared.map(([t, c]) => multPill(t, c)).join('');
+    const gaps = (r.uncovered_types || []).map(t => multPill(t, '')).join('');
+
+    box.innerHTML = `
+      <div class="ta-line"><span class="ta-lbl">SHARED WEAK</span>
+        ${sharedPills || '<span class="ta-ok">none - balanced</span>'}</div>
+      <div class="ta-line"><span class="ta-lbl">NO COVERAGE</span>
+        ${gaps || '<span class="ta-ok">all types covered</span>'}</div>`;
+  } catch (e) { /* analysis is optional, never block the UI */ }
+}
+
 renderTeam();
 
 // ── Notify ──
@@ -1012,12 +1255,13 @@ document.addEventListener('keydown', e => {
   if (e.code === 'KeyA') addToTeam();
   if (e.code === 'KeyT') toggleTeam();
   if (e.code === 'KeyC') clearTeam();
+  if (e.code === 'KeyF') document.getElementById('fileInput').click();
 });
 </script>
 </body>
 </html>"""
 
 if __name__ == "__main__":
-    import webbrowser
+    import webbrowser  # noqa: F401
     webbrowser.open("http://localhost:5000")
     app.run(host="0.0.0.0", port=5000, debug=False)
