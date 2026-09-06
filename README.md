@@ -187,7 +187,21 @@ python model/train.py --arch efficientnet_b2 --resume
 `tools/fetch_sprites.py` pulls front, back, shiny, official artwork, HOME
 renders and three generations of game sprites from the PokeAPI repository. The
 artwork and HOME renders matter most: they are large and shaded, much closer to
-a photo of a figure than a 96x96 game sprite. Roughly 7,000 images from 809.
+a photo of a figure than a 96x96 game sprite.
+
+Measured before and after on this repo's checkout:
+
+| | before | after |
+|---|---|---|
+| images | 809 | 7,351 |
+| per class | 1 | 8 min, 9 median |
+| classes with only one image | 809 | 0 |
+| classes present in validation | 0 | 809 |
+
+That last row is the one that matters. With one image per class a stratified
+split has nothing to hold out, so no validation was possible at all and any
+accuracy number described the training set. Too few images per class is the
+real ceiling here, ahead of any architecture change.
 
 What changed from the original notebook recipe:
 
